@@ -2,28 +2,11 @@ import os
 import pandas as pd
 import numpy as np
 from scipy.stats import chi2
+from statsmodels.stats.multitest import multipletests  # Benjamini-Hochberg correction
 
 # Get the current working directory
 directory = os.getcwd()
 print(f"Checking directory: {directory}")
-
-def benjamini_hochberg(p_values):
-    """Apply Benjamini-Hochberg FDR correction to a list of p-values."""
-    m = len(p_values)  # Number of tests
-    sorted_indices = np.argsort(p_values)  # Sort indices by p-values
-    sorted_p_values = np.array(p_values)[sorted_indices]
-    adjusted_p_values = np.zeros(m)
-
-    min_value = 1
-    for i in range(m, 0, -1):
-        rank = i
-        min_value = min(min_value, (m / rank) * sorted_p_values[i - 1])
-        adjusted_p_values[i - 1] = min_value
-
-    # Rearrange adjusted p-values back to original order
-    corrected_p_values = np.zeros(m)
-    corrected_p_values[sorted_indices] = adjusted_p_values
-    return corrected_p_values
 
 # Find all CSV files in the directory
 csv_files = [f for f in os.listdir(directory) if f.endswith(".csv")]
@@ -36,22 +19,32 @@ if not csv_files:
 for filename in csv_files:
     file_path = os.path.join(directory, filename)
     df = pd.read_csv(file_path)
+    print(f"\nProcessing file: {filename} with {len(df)} rows.")
 
-    # Check if required columns exist
+    # Ensure necessary columns exist
     required_cols = {"Folder", "lnL"}
     if not required_cols.issubset(df.columns):
         print(f"Skipping {filename}: Missing required columns {required_cols}")
         continue
 
-    # Extract gene names by removing suffixes (_B, _BS, _BS_NULL, _M0)
-    df["Gene"] = df["Folder"].str.replace(r'(_B|_BS|_BS_NULL|_M0)$', '', regex=True)
+    # Extract gene names by removing suffixes (_B, _BS, _BS_NULL)
+    df["Gene"] = df["Folder"].str.replace(r'(_B|_BS|_BS_NULL)$', '', regex=True)
     unique_genes = df["Gene"].unique()
+    print(f"Unique genes found: {len(unique_genes)}")
 
-    # Perform LRT for Branch-site Model (_BS vs _BS_NULL)
+    ###### 1. Extract M0 lnL (global null model) ######
+    m0_row = df[df["Folder"] == "M0"]  # Find the M0 entry
+    if m0_row.empty:
+        print("⚠️ No M0 row found! Skipping branch model analysis.")
+        continue
+    lnL_m0 = m0_row.iloc[0]["lnL"]
+    print(f"Global M0 lnL: {lnL_m0}")
+
+    ###### 2. Branch-site Model (Gene_BS vs Gene_BS_NULL) ######
     branchsite_results = []
     for gene in unique_genes:
-        bs_data = df[df["Folder"].str.contains(f"{gene}_BS", regex=False)]
-        null_data = df[df["Folder"].str.contains(f"{gene}_BS_NULL", regex=False)]
+        bs_data = df[df["Folder"] == f"{gene}_BS"]
+        null_data = df[df["Folder"] == f"{gene}_BS_NULL"]
 
         if not bs_data.empty and not null_data.empty:
             lnL_bs = bs_data.iloc[0]['lnL']
@@ -67,24 +60,24 @@ for filename in csv_files:
                 "p_value": p_value
             })
 
-    # Convert to DataFrame
     branchsite_df = pd.DataFrame(branchsite_results)
 
-    # Apply Benjamini-Hochberg correction for Branch-site Model
+    # Apply Benjamini-Hochberg Correction (SciPy's built-in)
     if not branchsite_df.empty:
-        branchsite_df['FDR_Corrected_P'] = benjamini_hochberg(branchsite_df["p_value"].values)
+        branchsite_df['FDR_Corrected_P'] = multipletests(branchsite_df["p_value"], method="fdr_bh")[1]
+        branchsite_df['Significant (FDR < 0.05)'] = np.where(branchsite_df['FDR_Corrected_P'] < 0.05, "Yes", "No")
 
-    # Perform LRT for Branch Model (_B vs M0)
+    print(f"Branchsite model results: {len(branchsite_df)} rows")
+
+    ###### 3. Branch Model (Gene_B vs M0) ######
     branch_model_results = []
     for gene in unique_genes:
-        branch_data = df[df['Folder'].str.contains(f'{gene}_B', regex=False)]
-        m0_data = df[df['Folder'].str.contains(f'{gene}_M0', regex=False)]
+        branch_data = df[df["Folder"] == f"{gene}_B"]
 
-        if not branch_data.empty and not m0_data.empty:
+        if not branch_data.empty:
             lnL_branch = branch_data.iloc[0]['lnL']
-            lnL_m0 = m0_data.iloc[0]['lnL']
             lrt_value_branch = 2 * (lnL_branch - lnL_m0)
-            p_value_branch = chi2.sf(lrt_value_branch, df=1)
+            p_value_branch = 1 - chi2.cdf(lrt_value_branch, df=1)
 
             branch_model_results.append({
                 "Gene": gene,
@@ -94,14 +87,16 @@ for filename in csv_files:
                 "p_value": p_value_branch
             })
 
-    # Convert to DataFrame
     branch_model_df = pd.DataFrame(branch_model_results)
 
-    # Apply Benjamini-Hochberg correction for Branch Model
+    # Apply Benjamini-Hochberg Correction
     if not branch_model_df.empty:
-        branch_model_df["BH_FDR"] = benjamini_hochberg(branch_model_df["p_value"].values)
+        branch_model_df["FDR_Corrected_P"] = multipletests(branch_model_df["p_value"], method="fdr_bh")[1]
+        branch_model_df['Significant (FDR < 0.05)'] = np.where(branch_model_df['FDR_Corrected_P'] < 0.05, "Yes", "No")
 
-    # Save results to an Excel file
+    print(f"Branch model results: {len(branch_model_df)} rows")
+
+    ######  4. Save Results to Excel ######
     output_file = f"LRT_results_{filename.replace('.csv', '.xlsx')}"
     with pd.ExcelWriter(output_file) as writer:
         if not branchsite_df.empty:
